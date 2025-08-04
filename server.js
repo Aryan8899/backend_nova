@@ -20,15 +20,12 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 app.use(cors({
-  origin: [
-    'http://localhost:3001',
-    'http://localhost:5500',
-    'http://127.0.0.1:5500'
-  ],
+  origin: '*', // Allows all domains
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-recaptcha-token']
 }));
+
 
 
 // Trust proxy for getting real IP addresses (important for reCAPTCHA)

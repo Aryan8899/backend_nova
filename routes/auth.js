@@ -1,3 +1,4 @@
+// routes/auth.js
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const { query } = require('../config/database');
@@ -5,10 +6,32 @@ const { generateToken, generateRefreshToken } = require('../middleware/auth');
 const { validateRegistration, validateLogin } = require('../middleware/validation');
 const { requireRecaptchaForRegistration, requireRecaptchaForLogin } = require('../middleware/recaptcha');
 const { asyncHandler, AppError } = require('../middleware/errorHandler');
+// const { sendVerificationEmail, sendWelcomeEmail } = require('../config/email');
+const { sendEmail } = require('../config/email');
 
 const router = express.Router();
 
-// Register new user (with reCAPTCHA)
+
+// Send verification email after user registration
+const sendVerificationEmail = async (userId, verificationCode, firstName) => {
+  const subject = 'Email Verification';
+  const text = `Hello ${firstName || 'User'},\n\nPlease verify your email by entering the following code: ${verificationCode}\n\nThe code expires in 10 minutes.\n\nThank you!`;
+
+  const emailResult = await sendEmail(userId, subject, text);
+
+  if (emailResult.success) {
+    console.log(`✅ Verification email sent to user: ${firstName}`);
+  } else {
+    console.error('❌ Failed to send verification email');
+  }
+};
+
+// Generate random 6-digit verification code
+const generateVerificationCode = () => {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+};
+
+// Register new user (with reCAPTCHA and email verification)
 router.post('/register', 
   requireRecaptchaForRegistration, 
   validateRegistration, 
@@ -29,39 +52,170 @@ router.post('/register',
     const saltRounds = 12;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
-    // Insert new user
+    // Generate verification code
+    const verificationCode = generateVerificationCode();
+    const verificationExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Insert new user (unverified)
     const result = await query(
-      `INSERT INTO users (email, password, first_name, last_name) 
-       VALUES ($1, $2, $3, $4) 
-       RETURNING id, email, first_name, last_name, created_at`,
-      [email, hashedPassword, first_name || null, last_name || null]
+      `INSERT INTO users (
+        email, password, first_name, last_name, 
+        is_verified, verification_code, verification_expires
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7) 
+      RETURNING id, email, first_name, last_name, created_at`,
+      [email, hashedPassword, first_name || null, last_name || null, false, verificationCode, verificationExpires]
     );
 
     const newUser = result.rows[0];
 
-    // Generate tokens
-    const token = generateToken(newUser);
-    const refreshToken = generateRefreshToken(newUser);
-
-    // Log successful registration with reCAPTCHA info
-    console.log(`✅ New user registered: ${email}, reCAPTCHA score: ${req.recaptcha?.score || 'N/A'}`);
+    // Send verification email
+    try {
+      await sendVerificationEmail(email, verificationCode, first_name);
+      console.log(`✅ User registered and verification email sent: ${email}, reCAPTCHA score: ${req.recaptcha?.score || 'N/A'}`);
+    } catch (emailError) {
+      console.error('❌ Failed to send verification email:', emailError);
+      // Delete the user if email fails to send
+      await query('DELETE FROM users WHERE id = $1', [newUser.id]);
+      throw new AppError('Failed to send verification email. Please try again.', 500);
+    }
 
     res.status(201).json({
-      message: 'User registered successfully',
+      message: 'User registered successfully. Please check your email for verification code.',
       user: {
         id: newUser.id,
         email: newUser.email,
         first_name: newUser.first_name,
         last_name: newUser.last_name,
-        created_at: newUser.created_at
+        created_at: newUser.created_at,
+        is_verified: false
       },
-      token,
-      refreshToken
+      next_step: 'Please verify your email using the code sent to your email address'
     });
   })
 );
 
-// Login user (with reCAPTCHA)
+// Verify email with code
+router.post('/verify-email', asyncHandler(async (req, res) => {
+  const { email, verificationCode } = req.body;
+
+  if (!email || !verificationCode) {
+    throw new AppError('Email and verification code are required', 400);
+  }
+
+  // Find user with matching email and verification code
+  const result = await query(
+    `SELECT id, email, first_name, last_name, verification_code, verification_expires, is_verified 
+     FROM users 
+     WHERE email = $1 AND is_active = true`,
+    [email]
+  );
+
+  if (result.rows.length === 0) {
+    throw new AppError('User not found', 404);
+  }
+
+  const user = result.rows[0];
+
+  // Check if already verified
+  if (user.is_verified) {
+    throw new AppError('Email is already verified', 400);
+  }
+
+  // Check if verification code matches
+  if (user.verification_code !== verificationCode) {
+    throw new AppError('Invalid verification code', 400);
+  }
+
+  // Check if code has expired
+  if (new Date() > new Date(user.verification_expires)) {
+    throw new AppError('Verification code has expired. Please request a new one.', 400);
+  }
+
+  // Update user as verified
+  await query(
+    `UPDATE users 
+     SET is_verified = true, verification_code = NULL, verification_expires = NULL, updated_at = CURRENT_TIMESTAMP
+     WHERE id = $1`,
+    [user.id]
+  );
+
+  // Generate tokens for verified user
+  const token = generateToken(user);
+  const refreshToken = generateRefreshToken(user);
+
+  // Send welcome email
+  try {
+    await sendWelcomeEmail(user.email, user.first_name);
+  } catch (emailError) {
+    console.error('❌ Failed to send welcome email:', emailError);
+    // Don't fail the verification if welcome email fails
+  }
+
+  console.log(`✅ Email verified for user: ${email}`);
+
+  res.json({
+    message: 'Email verified successfully! Your account is now active.',
+    user: {
+      id: user.id,
+      email: user.email,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      is_verified: true
+    },
+    token,
+    refreshToken
+  });
+}));
+
+// Resend verification code
+router.post('/resend-verification', asyncHandler(async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    throw new AppError('Email is required', 400);
+  }
+
+  // Find unverified user
+  const result = await query(
+    'SELECT id, first_name, is_verified FROM users WHERE email = $1 AND is_active = true',
+    [email]
+  );
+
+  if (result.rows.length === 0) {
+    throw new AppError('User not found', 404);
+  }
+
+  const user = result.rows[0];
+
+  if (user.is_verified) {
+    throw new AppError('Email is already verified', 400);
+  }
+
+  // Generate new verification code
+  const verificationCode = generateVerificationCode();
+  const verificationExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+  // Update verification code
+  await query(
+    'UPDATE users SET verification_code = $1, verification_expires = $2 WHERE id = $3',
+    [verificationCode, verificationExpires, user.id]
+  );
+
+  // Send new verification email
+  try {
+    await sendVerificationEmail(email, verificationCode, user.first_name);
+    console.log(`✅ Verification code resent to: ${email}`);
+  } catch (emailError) {
+    console.error('❌ Failed to resend verification email:', emailError);
+    throw new AppError('Failed to send verification email. Please try again.', 500);
+  }
+
+  res.json({
+    message: 'Verification code sent successfully. Please check your email.'
+  });
+}));
+
+// Login user (with reCAPTCHA) - Only allow verified users
 router.post('/login', 
   requireRecaptchaForLogin, 
   validateLogin, 
@@ -70,7 +224,7 @@ router.post('/login',
 
     // Find user
     const result = await query(
-      'SELECT id, email, password, first_name, last_name, is_active FROM users WHERE email = $1',
+      'SELECT id, email, password, first_name, last_name, is_active, is_verified FROM users WHERE email = $1',
       [email]
     );
 
@@ -83,6 +237,11 @@ router.post('/login',
     // Check if user is active
     if (!user.is_active) {
       throw new AppError('Account has been deactivated', 401);
+    }
+
+    // Check if email is verified
+    if (!user.is_verified) {
+      throw new AppError('Please verify your email address before logging in', 401);
     }
 
     // Verify password
@@ -105,7 +264,8 @@ router.post('/login',
         id: user.id,
         email: user.email,
         first_name: user.first_name,
-        last_name: user.last_name
+        last_name: user.last_name,
+        is_verified: user.is_verified
       },
       token,
       refreshToken
@@ -129,14 +289,14 @@ router.post('/refresh', asyncHandler(async (req, res) => {
       throw new AppError('Invalid refresh token', 401);
     }
 
-    // Check if user still exists and is active
+    // Check if user still exists, is active, and verified
     const userResult = await query(
-      'SELECT id, email, first_name, last_name, is_active FROM users WHERE id = $1',
+      'SELECT id, email, first_name, last_name, is_active, is_verified FROM users WHERE id = $1',
       [decoded.userId]
     );
 
-    if (userResult.rows.length === 0 || !userResult.rows[0].is_active) {
-      throw new AppError('User not found or inactive', 401);
+    if (userResult.rows.length === 0 || !userResult.rows[0].is_active || !userResult.rows[0].is_verified) {
+      throw new AppError('User not found, inactive, or unverified', 401);
     }
 
     const user = userResult.rows[0];
@@ -167,9 +327,9 @@ router.post('/forgot-password', asyncHandler(async (req, res) => {
     throw new AppError('Email is required', 400);
   }
 
-  // Check if user exists
+  // Check if user exists and is verified
   const userResult = await query(
-    'SELECT id FROM users WHERE email = $1 AND is_active = true',
+    'SELECT id FROM users WHERE email = $1 AND is_active = true AND is_verified = true',
     [email.toLowerCase().trim()]
   );
 
